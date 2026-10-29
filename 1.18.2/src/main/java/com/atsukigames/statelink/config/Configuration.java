@@ -15,13 +15,17 @@ public class Configuration {
     public RecoveryConfig recovery = new RecoveryConfig();
     public static class RecoveryConfig {
         public boolean enabled = true;
-        public String mode = "safe";
+        // 2.4.0 defaults to availability-first recovery; World/DB rollback risk is accepted.
+        // Explicit existing mode/acknowledgement values are never rewritten.
+        public String mode = "last_checkpoint";
         public int retryIntervalSeconds = 5;
         public int maxWaitSeconds = 120;
-        public int lastCheckpointDelaySeconds = 60;
-        public boolean acknowledgeUnsafeRecovery = false;
+        public int lastCheckpointDelaySeconds = 5;
+        public boolean acknowledgeUnsafeRecovery = true;
         public int autoRecoverDelaySeconds = 5;
         public int maxCheckpointAgeSeconds = 30;
+        /** Maximum age of a server-thread attestation matching the unchanged durable checkpoint. */
+        public int maxVerifiedStateAgeSeconds = 120;
         public int maxAutoRecoveryAttempts = 12;
         public boolean acknowledgePotentialRollbackOrDuplication = false;
     }
@@ -61,6 +65,8 @@ public class Configuration {
         public String tableName = "player_data";
         public boolean sslEnabled = false;
         public int maxConnections = 10;
+        /** Extra Hikari connections reserved for lease renewal so bulk saves cannot exhaust them. */
+        public int leaseRenewalPoolSize = 3;
         public int connectionTimeoutMs = 2500;
         public int socketTimeoutMs = 2500;
         /** JDBC statement timeout; MySQL Connector/J applies this per statement. */
@@ -106,8 +112,8 @@ public class Configuration {
         public int loginDelayMs = 0;
         public String serverId = "server-unknown";
         public String coordinationTableName = "";
-        public long leaseDurationMs = 5000;
-        public long leaseRenewIntervalMs = 1500;
+        public long leaseDurationMs = 15000;
+        public long leaseRenewIntervalMs = 3000;
         public long handoffRetryInitialMs = 10;
         public long handoffRetryMaxMs = 250;
         public long joinSyncTimeoutMs = 15000;
@@ -255,6 +261,8 @@ public class Configuration {
             "recovery.acknowledgePotentialRollbackOrDuplication", "must explicitly acknowledge automatic recovery rollback/duplication risk");
         require(recovery.autoRecoverDelaySeconds >= 0, "recovery.autoRecoverDelaySeconds", "must be zero or greater");
         require(recovery.maxCheckpointAgeSeconds > 0, "recovery.maxCheckpointAgeSeconds", "must be positive");
+        require(recovery.maxVerifiedStateAgeSeconds > 0 && recovery.maxVerifiedStateAgeSeconds <= 86_400,
+            "recovery.maxVerifiedStateAgeSeconds", "must be between 1 and 86400");
         require(recovery.maxAutoRecoveryAttempts > 0 && recovery.maxAutoRecoveryAttempts <= 1000,
             "recovery.maxAutoRecoveryAttempts", "must be between 1 and 1000");
         require(!"last_checkpoint".equals(recovery.mode) || recovery.acknowledgeUnsafeRecovery,
@@ -273,6 +281,8 @@ public class Configuration {
         require(database.password != null && !database.password.isEmpty(), "database.password", "is required");
         require(database.port > 0 && database.port <= 65535, "database.port", "must be between 1 and 65535");
         require(database.maxConnections >= 2, "database.maxConnections", "must be at least 2");
+        require(database.leaseRenewalPoolSize >= 1 && database.leaseRenewalPoolSize <= 16,
+            "database.leaseRenewalPoolSize", "must be between 1 and 16 additional reserved connections");
         require(database.tableName != null && isSafeIdentifier(database.tableName),
             "database.tableName", "must match [A-Za-z0-9_]+");
         require(sync.coordinationTableName == null || sync.coordinationTableName.isBlank()
@@ -299,6 +309,13 @@ public class Configuration {
             "sync.leaseRenewIntervalMs", "must be at least 100 and less than leaseDurationMs");
         long safetyBudget = sync.leaseDurationMs - sync.leaseRenewIntervalMs - 250L;
         require(safetyBudget >= 1_000L, "sync.leaseRenewIntervalMs", "leaves less than 1000ms of local safety budget");
+        long renewalWindowAfterScheduledTick = sync.leaseDurationMs - 2L * sync.leaseRenewIntervalMs - 250L;
+        long ambiguousRenewalRevalidationBudget = database.connectionTimeoutMs + database.socketTimeoutMs
+            + Math.max(database.queryTimeoutMs, database.lockWaitTimeoutMs) + 250L;
+        require(renewalWindowAfterScheduledTick >= ambiguousRenewalRevalidationBudget,
+            "sync.leaseDurationMs", "must leave enough time after a scheduled renewal for one bounded COMMIT wait "
+                + "and fresh-connection authority revalidation; increase leaseDurationMs or reduce renewal interval "
+                + "only after reviewing the configured DB timeout bounds");
         require(database.connectionTimeoutMs <= safetyBudget, "database.connectionTimeoutMs",
             "must not exceed the lease safety budget");
         require(database.socketTimeoutMs <= safetyBudget, "database.socketTimeoutMs",

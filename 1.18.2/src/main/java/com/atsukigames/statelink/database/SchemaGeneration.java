@@ -171,6 +171,12 @@ public final class SchemaGeneration {
     static final Set<String> PROVENANCE_COLUMNS = Set.of(
         "domain_provenance_revision", "domain_provenance_generation", "domain_provenance_manifest");
 
+    /** Additive 2.3.0 checkpoint/attestation columns; exact names are recognized, never arbitrary extras. */
+    static final Set<String> VERIFIED_STATE_COLUMNS = Set.of(
+        "checkpoint_state_digest", "verified_state_server", "verified_state_session", "verified_state_fence",
+        "verified_state_revision", "verified_state_provenance_generation", "verified_state_provenance_manifest",
+        "verified_state_domains", "verified_state_digest", "verified_state_at");
+
     private SchemaGeneration() {}
 
     public static Detection detect(Connection connection, String playerTable, String coordinationTable,
@@ -195,6 +201,7 @@ public final class SchemaGeneration {
         Set<String> unknownColumns = new java.util.TreeSet<>(extra);
         unknownColumns.removeAll(PRE_PROVENANCE_COLUMNS);
         unknownColumns.removeAll(PROVENANCE_COLUMNS);
+        unknownColumns.removeAll(VERIFIED_STATE_COLUMNS);
         if (!unknownColumns.isEmpty()) return unknown("coordination table has unrecognized columns " + unknownColumns);
         if (extra.containsAll(PROVENANCE_COLUMNS)) {
             return new Detection(Generation.CURRENT_PROVENANCE, "domain provenance columns present");

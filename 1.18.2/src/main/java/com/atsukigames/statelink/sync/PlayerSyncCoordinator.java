@@ -29,6 +29,9 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
@@ -47,6 +50,8 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
     private final DatabaseManager database;
     private final PlayerSessionManager sessions = new PlayerSessionManager();
     private final PerPlayerSerialExecutor serialExecutor;
+    /** Renewal must not wait behind bulk SAVE work; both worker and queue remain bounded. */
+    private final ThreadPoolExecutor leaseRenewalExecutor;
     private final ScheduledExecutorService scheduler;
     private final AtomicBoolean stopping = new AtomicBoolean();
     /** イベント側のsession map更新とshutdownの初期化を同一の短い境界で直列化する。 */
@@ -75,7 +80,25 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
         this.database = database;
         this.repository = repository;
         int parallelism = Math.max(2, Math.min(config.database.maxConnections, 8));
-        this.serialExecutor = new PerPlayerSerialExecutor(parallelism, Math.max(64, config.database.maxConnections * 64));
+        // Bounded admission includes running work. 2.3.1 qualification observed max depth 2 for
+        // one UUID and DB worker backlog 17 under 20-player mixed load; these limits leave headroom
+        // while putting a hard ceiling on retained snapshots/callbacks.
+        this.serialExecutor = new PerPlayerSerialExecutor(
+            parallelism, PerPlayerSerialExecutor.DEFAULT_PER_PLAYER_LIMIT,
+            PerPlayerSerialExecutor.DEFAULT_TOTAL_PENDING_LIMIT);
+        int renewalWorkers = config.database.leaseRenewalPoolSize;
+        this.leaseRenewalExecutor = new ThreadPoolExecutor(
+            renewalWorkers,
+            renewalWorkers,
+            0L,
+            TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(Math.max(32, renewalWorkers * 32)),
+            runnable -> {
+                Thread thread = new Thread(runnable, "StateLink-lease-renewal");
+                thread.setDaemon(true);
+                return thread;
+            },
+            new ThreadPoolExecutor.AbortPolicy());
         this.scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "StateLink-scheduler");
             thread.setDaemon(true);
@@ -96,9 +119,11 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
             StateLink.LOGGER.warn("UNSAFE recovery.mode={}: externalized World state may duplicate, disappear or roll back",config.recovery.mode);
         }
         StateLink.LOGGER.info(
-            "Lease timing leaseDurationMs={} renewIntervalMs={} localSafetyDeadlineMs={} diagnosticLogging={}",
+            "Lease timing leaseDurationMs={} renewIntervalMs={} localSafetyDeadlineMs={} "
+                + "reservedRenewalPoolSize={} verifiedStateMaxAgeSeconds={} diagnosticLogging={}",
             config.sync.leaseDurationMs, config.sync.leaseRenewIntervalMs,
-            Math.max(1L, config.sync.leaseDurationMs - config.sync.leaseRenewIntervalMs),
+            TimeUnit.NANOSECONDS.toMillis(leaseSafetyBudgetNanos()),
+            config.database.leaseRenewalPoolSize, config.recovery.maxVerifiedStateAgeSeconds,
             config.database.diagnosticLogging);
     }
 
@@ -218,7 +243,6 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                 try { return repository.recoveryCandidates(16, recoveryScanCursor); }
                 catch (Exception error) { throw new DatabaseOperationException(error); }
             }).thenCompose(ids -> {
-                recoveryScanCursor = ids.isEmpty() ? null : ids.get(ids.size() - 1);
                 CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
                 for (UUID uuid : ids) {
                     chain = chain.thenCompose(ignored -> serialExecutor.submit(uuid, () -> {
@@ -231,13 +255,29 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                         return (Void) null;
                     }));
                 }
-                return chain;
+                // Advance only after every row operation in this bounded batch was admitted and
+                // completed. Queue overflow leaves recovery durable/fail-closed and retries the
+                // same cursor on the next scheduled scan instead of skipping the unvisited tail.
+                UUID nextCursor = ids.isEmpty() ? null : ids.get(ids.size() - 1);
+                return chain.thenRun(() -> recoveryScanCursor = nextCursor);
             });
         } catch (RuntimeException error) {
             recoveryScanInFlight.set(false);
             return;
         }
-        work.whenComplete((ignored, error) -> recoveryScanInFlight.set(false));
+        work.whenComplete((ignored, error) -> {
+            recoveryScanInFlight.set(false);
+            if (error != null && !stopping.get()) {
+                Throwable cause = unwrap(error);
+                long repeats = recoveryDeferralLog.permit(
+                    RECOVERY_SCAN_QUEUE, "scan-deferred:" + cause.getClass().getSimpleName());
+                if (repeats > 0) {
+                    StateLink.LOGGER.warn(
+                        "Automatic recovery scan batch deferred; no PlayerData was applied, recovery remains fail-closed "
+                            + "suppressedBatches={} error={}", repeats, cause.toString());
+                }
+            }
+        });
     }
 
     private boolean permitsRiskAcknowledgedAutomaticRecovery() {
@@ -262,8 +302,9 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
             config.recovery.autoRecoverDelaySeconds,config.recovery.maxCheckpointAgeSeconds,
             config.migration == null ? config.recovery.maxCheckpointAgeSeconds
                 : config.migration.legacy211RecoveryMaxCheckpointAgeSeconds,
-            config.recovery.maxAutoRecoveryAttempts,config.recovery.retryIntervalSeconds,
-            config.recovery.acknowledgePotentialRollbackOrDuplication);
+            config.recovery.maxVerifiedStateAgeSeconds, config.recovery.maxAutoRecoveryAttempts,
+            config.recovery.retryIntervalSeconds, config.recovery.acknowledgePotentialRollbackOrDuplication,
+            config.sync);
         else result=repository.resolveUnsafeLastCheckpoint(uuid,status.fence(),status.revision(),operation,actor,
             config.recovery.lastCheckpointDelaySeconds,config.recovery.acknowledgeUnsafeRecovery);
         if(permitsRiskAcknowledgedAutomaticRecovery() && (result.status()==PlayerDataRepository.RecoveryResolutionStatus.RESOLVED
@@ -637,27 +678,25 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                 return;
             }
 
-            CompletePlayerData deathSnapshot = null;
+            CheckpointCapture<CompletePlayerData> deathCapture = null;
             if (!alive && config.save.saveOnDeath && context.state() == SyncState.READY) {
-                deathSnapshot = extractLiveCheckpointOnServerThread(
-                    currentServer, oldPlayer, context.pendingDisconnectItemsJson());
+                deathCapture = captureCheckpointOnServerThread(currentServer, oldPlayer, context);
             }
             boolean dimensionChanged = !oldPlayer.getWorld().equals(newPlayer.getWorld());
             sessions.updatePlayer(context, newPlayer);
 
-            if (deathSnapshot != null) {
-                queueSnapshot(context, deathSnapshot, SaveReason.DEATH);
+            if (deathCapture != null) {
+                queueSnapshot(context, deathCapture, SaveReason.DEATH);
             }
             if (alive && dimensionChanged && config.sync.syncOnDimensionChange && config.save.saveOnDimensionChange
                     && context.state() == SyncState.READY) {
                 queueSnapshot(context,
-                    extractLiveCheckpointOnServerThread(
-                        currentServer, newPlayer, context.pendingDisconnectItemsJson()), SaveReason.DIMENSION);
+                    captureCheckpointOnServerThread(currentServer, newPlayer, context), SaveReason.DIMENSION);
             }
         }
     }
 
-    /** READY playerのleaseを定期的に確認する。renewもUUID単位のqueueを通す。 */
+    /** READY playerのleaseを定期確認する。SAVE workerとは分離したbounded renewal executorを使う。 */
     private void renewReadySessions() {
         if (stopping.get()) return;
         long scheduledAtNanos = nextRenewScheduledNanos;
@@ -688,9 +727,10 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
     ) {
         Ownership ownership = ownership(context);
         long enqueueNanos = System.nanoTime();
-        int queueDepthAtSubmit = serialExecutor.queueDepth(context.uuid());
+        int queueDepthAtSubmit = leaseRenewalExecutor.getQueue().size();
+        long localSafetyDeadlineNanos = leaseSafetyDeadlineNanos(context);
         try {
-            serialExecutor.submit(context.uuid(), () -> {
+            CompletableFuture.supplyAsync(() -> {
                 long workerStartNanos = System.nanoTime();
                 logDbQueueDiagnostic(
                         "RENEW_LEASE", context, enqueueNanos, workerStartNanos, queueDepthAtSubmit);
@@ -704,12 +744,12 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                     }
                     dbStartNanos = System.nanoTime();
                     LeaseRenewalResult renewal = repository.renewLeaseWithResult(
-                        ownership, config.sync.leaseDurationMs);
+                        ownership, config.sync.leaseDurationMs, localSafetyDeadlineNanos);
                     long dbEndNanos = System.nanoTime();
                     return new RenewOutcome(
                         renewal.renewed(), renewal.leaseAnchorNanos(), scheduledAtNanos, schedulerExecutionNanos,
                         workerStartNanos, dbStartNanos, dbEndNanos, queueDepthAtSubmit,
-                        serialExecutor.metrics(), database.poolMetrics());
+                        leaseRenewalExecutorMetrics(), database.leaseRenewalPoolMetrics());
                 } catch (Exception error) {
                     long failedAtNanos = System.nanoTime();
                     logRenewDiagnostic(
@@ -718,7 +758,7 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                         "FAILURE", error);
                     throw new RenewException(error);
                 }
-            }).whenComplete((renewed, error) -> {
+            }, leaseRenewalExecutor).whenComplete((renewed, error) -> {
                 context.endLeaseRenew();
                 if (renewed != null) {
                     logRenewDiagnostic(
@@ -758,7 +798,26 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
             StateLink.LOGGER.error(
                 "Lease renew could not be queued uuid={} session={} fence={}",
                 context.uuid(), shortId(context.localSessionId()), context.fencingToken(), error);
+            // A rejected renewal is not a renewal. Do not keep the session READY while
+            // waiting for another scheduler tick to retry an overloaded queue.
+            boolean rejected = failClosedForRenewalAdmission(error,
+                () -> loseAuthority(context, "lease renewal admission rejected", error));
+            if (!rejected && !withinLeaseSafetyMargin(context)) {
+                loseAuthority(context, "lease renewal could not be queued past safety deadline", error);
+            }
         }
+    }
+
+    static boolean failClosedForRenewalAdmission(Throwable error, Runnable failClosed) {
+        if (!(error instanceof RejectedExecutionException)) return false;
+        failClosed.run();
+        return true;
+    }
+
+    private PerPlayerSerialExecutor.ExecutorMetrics leaseRenewalExecutorMetrics() {
+        return new PerPlayerSerialExecutor.ExecutorMetrics(
+            leaseRenewalExecutor.getActiveCount(), leaseRenewalExecutor.getPoolSize(),
+            leaseRenewalExecutor.getQueue().size(), leaseRenewalExecutor.getCompletedTaskCount());
     }
 
     private void logDbQueueDiagnostic(
@@ -770,17 +829,22 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
     ) {
         if (!config.database.diagnosticLogging) return;
         PerPlayerSerialExecutor.ExecutorMetrics executorMetrics = serialExecutor.metrics();
+        PerPlayerSerialExecutor.QueueMetrics serialQueue = serialExecutor.queueMetrics();
         DatabaseManager.PoolMetrics poolMetrics = database.poolMetrics();
         StateLink.LOGGER.info(
             "STATELINK_DB_QUEUE operation={} uuid={} session={} fence={} revision={} thread={} "
                 + "enqueueMonoNanos={} workerStartMonoNanos={} queueDelayMs={} "
                 + "perPlayerQueueDepthAtSubmit={} perPlayerQueueDepthAtWorker={} "
+                + "serialPending={} serialPendingLimit={} serialMaxObservedPending={} "
+                + "serialActivePlayers={} serialRejectedPerPlayer={} serialRejectedTotal={} "
                 + "dbWorkerActive={} dbWorkerPoolSize={} dbWorkerQueue={} "
                 + "poolActive={} poolIdle={} poolTotal={} poolWaiting={}",
             operation, context.uuid(), shortId(context.localSessionId()), context.fencingToken(),
             context.lastSuccessfulRevision(), Thread.currentThread().getName(), enqueueNanos,
             workerStartNanos, elapsedMillis(workerStartNanos - enqueueNanos), queueDepthAtSubmit,
-            serialExecutor.queueDepth(context.uuid()), executorMetrics.active(), executorMetrics.poolSize(),
+            serialExecutor.queueDepth(context.uuid()), serialQueue.pending(), serialQueue.totalPendingLimit(),
+            serialQueue.maxObservedPending(), serialQueue.activePlayers(), serialQueue.rejectedPerPlayer(),
+            serialQueue.rejectedTotal(), executorMetrics.active(), executorMetrics.poolSize(),
             executorMetrics.queued(), poolMetrics.active(), poolMetrics.idle(), poolMetrics.total(),
             poolMetrics.waiting());
     }
@@ -800,7 +864,7 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
         logRenewDiagnostic(
             context, ownership, scheduledAtNanos, schedulerExecutionNanos, workerStartNanos,
             dbStartNanos, dbEndNanos, queueDepthAtSubmit, outcome, failure,
-            serialExecutor.metrics(), database.poolMetrics());
+            leaseRenewalExecutorMetrics(), database.leaseRenewalPoolMetrics());
     }
 
     private void logRenewDiagnostic(
@@ -839,8 +903,7 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
         if (!config.database.diagnosticLogging) return;
         long nowNanos = System.nanoTime();
         long ageNanos = Math.max(0L, nowNanos - context.lastLeaseRenewNanos());
-        long safetyBudgetNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(1L,
-            config.sync.leaseDurationMs - config.sync.leaseRenewIntervalMs));
+        long safetyBudgetNanos = leaseSafetyBudgetNanos();
         long remainingBudgetNanos = safetyBudgetNanos - ageNanos;
         SqlFailure failureInfo = SqlFailure.from(failure);
         StateLink.LOGGER.info(
@@ -848,8 +911,8 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                 + "scheduledAtMonoNanos={} actualExecutionAtMonoNanos={} workerStartMonoNanos={} "
                 + "schedulerDelayMs={} queueDelayMs={} dbDurationMs={} "
                 + "timeSinceLastSuccessfulRenewMs={} remainingLocalSafetyBudgetMs={} "
-                + "perPlayerQueueDepthAtSubmit={} perPlayerQueueDepthAtWorker={} "
-                + "dbWorkerActive={} dbWorkerPoolSize={} dbWorkerQueue={} "
+                + "renewalQueueDepthAtSubmit={} renewalQueueDepthAtWorker={} "
+                + "renewalWorkerActive={} renewalWorkerPoolSize={} renewalWorkerQueue={} "
                 + "poolActive={} poolIdle={} poolTotal={} poolWaiting={} outcome={} "
                 + "sqlState={} vendorCode={} failureType={}",
             context.uuid(), shortId(ownership.ownerSession()), ownership.fencingToken(),
@@ -858,7 +921,7 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
             elapsedMillis(schedulerExecutionNanos - scheduledAtNanos),
             elapsedMillis(workerStartNanos - schedulerExecutionNanos),
             elapsedMillis(Math.max(0L, dbEndNanos - dbStartNanos)), elapsedMillis(ageNanos),
-            elapsedMillis(remainingBudgetNanos), queueDepthAtSubmit, serialExecutor.queueDepth(context.uuid()),
+            elapsedMillis(remainingBudgetNanos), queueDepthAtSubmit, leaseRenewalExecutor.getQueue().size(),
             executorMetrics.active(), executorMetrics.poolSize(), executorMetrics.queued(),
             poolMetrics.active(), poolMetrics.idle(), poolMetrics.total(), poolMetrics.waiting(), outcome,
             failureInfo.sqlState(), failureInfo.vendorCode(), failureInfo.failureType());
@@ -897,6 +960,7 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                 "ACQUIRE_LOAD", context, enqueueNanos, System.nanoTime(), queueDepthAtSubmit);
             if (stopping.get() || context.isClosed() || !sessions.isCurrent(context)) return null;
             try {
+                PlayerDataRepository.RecoveryResolutionStatus recoveryDecision = null;
                 AcquireResult result = repository.acquireOwnershipAndLoad(
                     context.uuid(),
                     config.sync.serverId,
@@ -905,6 +969,7 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                 );
                 if (result.status()==AcquireStatus.RECOVERY_REQUIRED && permitsRiskAcknowledgedAutomaticRecovery()) {
                     var recovered=attemptPolicyRecovery(context.uuid());
+                    if (recovered != null) recoveryDecision = recovered.status();
                     if(recovered!=null && (recovered.status()==PlayerDataRepository.RecoveryResolutionStatus.RESOLVED
                             || recovered.status()==PlayerDataRepository.RecoveryResolutionStatus.ALREADY_RESOLVED)
                             && !stopping.get() && !context.isClosed() && sessions.isCurrent(context)) {
@@ -926,13 +991,13 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                         return null;
                     }
                 }
-                return result;
+                return new AcquireCompletion(result, recoveryDecision);
             } catch (Exception databaseError) {
                 throw new DatabaseOperationException(databaseError);
             }
         }).whenComplete((completion, error) -> {
             if (completion == null && error == null) return;
-            AcquireResult result = completion;
+            AcquireResult result = completion == null ? null : completion.result();
             // stopping/stale判定をserver thread callbackまで遅らせない。shutdownが
             // datasourceを閉じる前に、ownershipを取得済みならこのcompletion threadで回収する。
             if (result != null && result.ownership() != null
@@ -941,9 +1006,13 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                 return;
             }
             server.execute(() -> handleAcquireResult(
-                context, server, result, error, attempt));
+                context, server, result, error, attempt,
+                completion == null ? null : completion.recoveryDecision()));
         });
     }
+
+    private record AcquireCompletion(AcquireResult result,
+        PlayerDataRepository.RecoveryResolutionStatus recoveryDecision) {}
 
     /** このメソッドはserver thread上で実行される。 */
     private void handleAcquireResult(
@@ -951,7 +1020,8 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
         MinecraftServer server,
         AcquireResult result,
         Throwable error,
-        int attempt
+        int attempt,
+        PlayerDataRepository.RecoveryResolutionStatus recoveryDecision
     ) {
         if (!sessions.isCurrent(context)) {
             if (result != null && result.ownership() != null) {
@@ -989,7 +1059,8 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
         if (result.status() == AcquireStatus.RECOVERY_REQUIRED) {
             ServerPlayerEntity player = server.getPlayerManager().getPlayer(context.uuid());
             boolean current = sessions.isCurrent(context, player);
-            boolean operatorOnly = result.requiresOperatorReconciliation();
+            boolean operatorOnly = result.requiresOperatorReconciliation()
+                || RecoveryMessages.requiresAdministrator(recoveryDecision);
             if(permitsRiskAcknowledgedAutomaticRecovery() && !operatorOnly && current && !joinTimedOut(context)) {
                 if(attempt==0) player.sendMessage(net.minecraft.text.Text.of("Recovering synchronized player data..."),false);
                 submitAcquire(context,server,attempt+1,config.recovery.retryIntervalSeconds*1000L);
@@ -999,11 +1070,12 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
             sessions.remove(context);
             StateLink.LOGGER.warn(
                 "RECOVERY_REQUIRED login refused without LOAD/apply uuid={} reason={} previousOwnerServer={} "
-                    + "previousOwnerSession={} localSession={}", context.uuid(), result.recoveryReason(),
-                result.currentOwnerServer(), shortId(result.currentOwnerSession()), shortId(context.localSessionId()));
+                    + "previousOwnerSession={} localSession={} recoveryDecision={}; inspect with /statelink recovery inspect <uuid>",
+                context.uuid(), result.recoveryReason(), result.currentOwnerServer(),
+                shortId(result.currentOwnerSession()), shortId(context.localSessionId()), recoveryDecision);
             if (current && player != null) {
                 disconnect(player, RecoveryMessages.refusal(result.recoveryReason(), operatorOnly,
-                    permitsRiskAcknowledgedAutomaticRecovery()));
+                    permitsRiskAcknowledgedAutomaticRecovery(), recoveryDecision));
             }
             return;
         }
@@ -1397,14 +1469,15 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
         }
         Ownership ownership = ownership(context);
         try {
-            serialExecutor.submit(context.uuid(), () -> {
+            CompletableFuture.supplyAsync(() -> {
                 if (!sessions.isCurrent(context) || context.state() != SyncState.LOADING) return null;
                 try {
-                    return repository.renewLeaseWithResult(ownership, config.sync.leaseDurationMs);
+                    return repository.renewLeaseWithResult(ownership, config.sync.leaseDurationMs,
+                        leaseSafetyDeadlineNanos(context));
                 } catch (Exception databaseError) {
                     throw new DatabaseOperationException(databaseError);
                 }
-            }).whenComplete((renewal, error) -> {
+            }, leaseRenewalExecutor).whenComplete((renewal, error) -> {
                 if (stopping.get() || context.isClosed() || !sessions.isCurrent(context)) {
                     if (renewal != null && renewal.renewed()) {
                         releaseOwnershipFromWorker(ownership, "stale-loading-lease-revalidation");
@@ -1542,22 +1615,23 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
     public long periodicCheckpointsCoalesced() { return periodicCoalesced.get(); }
     public int maxObservedSaveQueueDepth() { return maxSaveQueueDepth.get(); }
 
-    private void queueSnapshot(PlayerSessionContext context, CompletePlayerData snapshot, SaveReason reason) {
-        if (stopping.get() || context == null || !context.canQueueNormalSave()) {
+    private void queueSnapshot(PlayerSessionContext context, CheckpointCapture<CompletePlayerData> capture,
+        SaveReason reason) {
+        if (stopping.get() || context == null || capture == null || !context.canQueueNormalSave()) {
             if (reason == SaveReason.PERIODIC && context != null) context.periodicSaveStarted();
             return;
         }
+        CompletePlayerData snapshot = capture.snapshot();
         if (!withinLeaseSafetyMargin(context)) {
             if (reason == SaveReason.PERIODIC) context.periodicSaveStarted();
             loseAuthority(context, "lease safety expired before save snapshot was queued", null);
             return;
         }
         long snapshotSequence = context.recordDirtySnapshot(snapshot, reason);
-        long changeVersion = context.checkpointChangeVersion();
         StateLink.LOGGER.debug(
             "SAVE queued uuid={} session={} fence={} reason={}",
             context.uuid(), shortId(context.localSessionId()), context.fencingToken(), reason);
-        submitNormalSave(context, snapshot, reason, snapshotSequence, changeVersion);
+        submitNormalSave(context, snapshot, reason, snapshotSequence, capture.changeVersion());
     }
 
     private void submitNormalSave(
@@ -1795,15 +1869,19 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
 
     private long leaseSafetyBudgetNanos() {
         long safetyDeadlineMs = Math.max(1L,
-            config.sync.leaseDurationMs - config.sync.leaseRenewIntervalMs);
+            config.sync.leaseDurationMs - config.sync.leaseRenewIntervalMs - 250L);
         return TimeUnit.MILLISECONDS.toNanos(safetyDeadlineMs);
+    }
+
+    private long leaseSafetyDeadlineNanos(PlayerSessionContext context) {
+        return context.lastLeaseRenewNanos() + leaseSafetyBudgetNanos();
     }
 
     /**
      * Player-originated World side effects retain at least three seconds before
-     * the DB lease's conservative expiry estimate. With the default 5s/1.5s
-     * lease this accepts anchors younger than 2s; a longer bounded JVM/server
-     * pause is still not made safe by a local check alone.
+     * the DB lease's conservative expiry estimate. With the default 15s/3s
+     * lease this accepts anchors younger than 12s; a longer JVM/server pause
+     * is still not made safe by a local check alone.
      */
     private long worldMutationLeaseSafetyBudgetNanos() {
         long minimumRemainingMs = Math.max(3_000L, config.sync.leaseRenewIntervalMs);
@@ -1845,6 +1923,11 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                         ownership.uuid(), shortId(ownership.ownerSession()), ownership.fencingToken(), reason, error);
                     return false;
                 }
+            }).whenComplete((released, error) -> {
+                if (error != null) StateLink.LOGGER.error(
+                    "Ownership release admission/execution failed uuid={} session={} fence={} reason={}",
+                    ownership.uuid(), shortId(ownership.ownerSession()), ownership.fencingToken(), reason,
+                    unwrap(error));
             });
         } catch (RuntimeException error) {
             StateLink.LOGGER.error(
@@ -1865,6 +1948,10 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                         ownership.uuid(), ownership.fencingToken(), reason, error);
                     return false;
                 }
+            }).whenComplete((marked, error) -> {
+                if (error != null) StateLink.LOGGER.warn(
+                    "Recovery mark admission/execution failed uuid={} fence={} reason={}; lease expiry remains fail-closed",
+                    ownership.uuid(), ownership.fencingToken(), reason, unwrap(error));
             });
         } catch (RuntimeException error) {
             StateLink.LOGGER.warn(
@@ -1878,9 +1965,13 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
         context.markDegraded();
         scheduleRecoveryRequired(ownership(context), PlayerDataRepository.RecoveryReason.LOCAL_AUTHORITY_LOST);
         StateLink.LOGGER.error(
-            "Lease lost / fencing detected uuid={} session={} fence={} reason={} lastSuccessfulRevision={} cause={}",
+            "Lease lost / fencing detected uuid={} session={} fence={} reason={} lastSuccessfulRevision={} "
+                + "leaseAgeMs={} safetyBudgetMs={} renewalQueue={} pool={} cause={}",
             context.uuid(), shortId(context.localSessionId()), context.fencingToken(), reason,
-            context.lastSuccessfulRevision(), cause);
+            context.lastSuccessfulRevision(),
+            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - context.lastLeaseRenewNanos()),
+            TimeUnit.NANOSECONDS.toMillis(leaseSafetyBudgetNanos()), leaseRenewalExecutor.getQueue().size(),
+            database.leaseRenewalPoolMetrics(), cause);
         MinecraftServer currentServer = server;
         if (currentServer != null) {
             currentServer.execute(() -> {
@@ -1888,7 +1979,8 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                 boolean current = sessions.isCurrent(context, player);
                 sessions.remove(context);
                 if (current) {
-                    disconnect(player, "Player data authority was lost. Please reconnect.");
+                    disconnect(player, "Player data ownership expired or was fenced. "
+                        + "Disconnected to protect your data; recovery may require an administrator.");
                 }
             });
         }
@@ -1961,7 +2053,17 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
             }
             try {
                 context.observeChangesOnServerThread(player,config.sync);
-                if (config.save.saveOnlyWhenDirty && !context.needsCheckpoint()) continue;
+                boolean dirty = context.needsCheckpoint();
+                if (config.save.saveOnlyWhenDirty && !dirty) {
+                    if (!context.tryReservePeriodicSave()) {
+                        periodicCoalesced.incrementAndGet();
+                        continue;
+                    }
+                    CheckpointCapture<CompletePlayerData> verificationCapture =
+                        captureCheckpointOnServerThread(server, player, context);
+                    submitStateAttestation(context, server, verificationCapture);
+                    continue;
+                }
                 // Coalesce: while an earlier periodic checkpoint has not even started, a second
                 // one would only lengthen this player's queue. The dirty epoch stays set, so the
                 // next interval captures a fresh snapshot instead.
@@ -1969,13 +2071,106 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
                     periodicCoalesced.incrementAndGet();
                     continue;
                 }
-                queueSnapshot(context, extractLiveCheckpointOnServerThread(
-                    server, player, context.pendingDisconnectItemsJson()), SaveReason.PERIODIC);
+                queueSnapshot(context, captureCheckpointOnServerThread(server, player, context), SaveReason.PERIODIC);
             } catch (RuntimeException error) {
                 context.periodicSaveStarted();
                 context.recordSnapshotCaptureFailure();
                 StateLink.LOGGER.warn("Periodic snapshot failed uuid={}", player.getUuid(), error);
             }
+        }
+    }
+
+    /** Full canonical comparison on the server thread; a heartbeat alone never attests data. */
+    private void submitStateAttestation(PlayerSessionContext context, MinecraftServer server,
+        CheckpointCapture<CompletePlayerData> capture) {
+        CompletePlayerData snapshot = capture.snapshot();
+        Ownership owner = ownership(context);
+        long enqueueNanos = System.nanoTime();
+        int queueDepth = serialExecutor.queueDepth(context.uuid());
+        serialExecutor.submit(context.uuid(), () -> {
+            long workerStarted = System.nanoTime();
+            logDbQueueDiagnostic("STATE_ATTESTATION", context, enqueueNanos, workerStarted, queueDepth);
+            if (!context.canQueueNormalSave() || !withinLeaseSafetyMargin(context)
+                    || context.checkpointChangeVersion() != capture.changeVersion()) return null;
+            try {
+                return repository.attestVerifiedState(snapshot, owner, config.sync,
+                    capture.capturedAtNanos(), capture.changeVersion(), context::checkpointChangeVersion);
+            } catch (Exception error) {
+                throw new DatabaseOperationException(error);
+            }
+        }).whenComplete((result, error) -> {
+            if (result == null && error == null) {
+                context.periodicSaveStarted();
+                return;
+            }
+            if (error != null) {
+                context.periodicSaveStarted();
+                Throwable cause = unwrap(error);
+                if (!withinLeaseSafetyMargin(context)) {
+                    loseAuthority(context, "lease safety expired during state attestation", cause);
+                } else {
+                    StateLink.LOGGER.warn("Verified-state attestation failed uuid={} session={} fence={} revision={} error={}",
+                        context.uuid(), shortId(context.localSessionId()), context.fencingToken(),
+                        context.lastSuccessfulRevision(), cause);
+                }
+                return;
+            }
+            switch (result.status()) {
+                case ATTESTED -> {
+                    context.periodicSaveStarted();
+                    StateLink.LOGGER.debug("Verified-state attested uuid={} session={} fence={} revision={}",
+                        context.uuid(), shortId(context.localSessionId()), context.fencingToken(), result.revision());
+                }
+                case DATA_CHANGED, CHECKPOINT_INTEGRITY_MISMATCH -> {
+                    if (!context.canQueueNormalSave() || !sessions.isCurrent(context)) {
+                        context.periodicSaveStarted();
+                        return;
+                    }
+                    StateLink.LOGGER.info("Canonical checkpoint comparison found changed state uuid={} revision={} status={}; SAVE queued",
+                        context.uuid(), result.revision(), result.status());
+                    queueFreshPeriodicSnapshotAfterAttestation(context, server);
+                }
+                case FENCED, REVISION_MISMATCH, PROVENANCE_UNKNOWN -> {
+                    context.periodicSaveStarted();
+                    loseAuthority(context, "verified-state attestation rejected: " + result.status(), null);
+                }
+            }
+        });
+    }
+
+    /** DATA_CHANGED invalidates the comparison snapshot; recapture current Player state on the MC thread. */
+    private void queueFreshPeriodicSnapshotAfterAttestation(PlayerSessionContext context, MinecraftServer server) {
+        Runnable recapture = () -> {
+            if (server == null || !server.isOnThread()) {
+                context.periodicSaveStarted();
+                StateLink.LOGGER.error("Cannot recapture changed checkpoint off the Minecraft server thread uuid={}",
+                    context.uuid());
+                return;
+            }
+            ServerPlayerEntity player = context.playerForServerThread();
+            if (stopping.get() || player == null || !context.canQueueNormalSave()
+                    || !sessions.isCurrent(context, player)) {
+                context.periodicSaveStarted();
+                return;
+            }
+            try {
+                queueSnapshot(context, captureCheckpointOnServerThread(server, player, context), SaveReason.PERIODIC);
+            } catch (RuntimeException error) {
+                context.periodicSaveStarted();
+                context.recordSnapshotCaptureFailure();
+                StateLink.LOGGER.warn("Fresh periodic snapshot after DATA_CHANGED failed uuid={}",
+                    context.uuid(), error);
+            }
+        };
+        try {
+            if (server == null) throw new IllegalStateException("Minecraft server is unavailable");
+            if (server.isOnThread()) recapture.run();
+            else server.execute(recapture);
+        } catch (RuntimeException schedulingError) {
+            context.periodicSaveStarted();
+            context.recordSnapshotCaptureFailure();
+            StateLink.LOGGER.warn("Could not dispatch fresh DATA_CHANGED snapshot to the server thread uuid={}",
+                context.uuid(), schedulingError);
         }
     }
 
@@ -2048,6 +2243,20 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
             if (!scheduler.awaitTermination(2, TimeUnit.SECONDS)) scheduler.shutdownNow();
         } catch (InterruptedException error) {
             scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+
+        leaseRenewalExecutor.shutdown();
+        try {
+            if (!leaseRenewalExecutor.awaitTermination(config.save.shutdownFlushTimeoutMs, TimeUnit.MILLISECONDS)) {
+                StateLink.LOGGER.error("Lease renewal executor did not terminate before shutdown timeout");
+                leaseRenewalExecutor.shutdownNow();
+                if (!leaseRenewalExecutor.awaitTermination(2, TimeUnit.SECONDS)) {
+                    StateLink.LOGGER.error("Lease renewal executor is still running; datasource close may abort renewal");
+                }
+            }
+        } catch (InterruptedException error) {
+            leaseRenewalExecutor.shutdownNow();
             Thread.currentThread().interrupt();
         }
 
@@ -2125,6 +2334,19 @@ public final class PlayerSyncCoordinator implements AutoCloseable {
         String effectivePending = CompletePlayerDataSerializer.composeCheckpointPendingItems(
             player, durablePendingItemsJson, activeTransient);
         return extractCompletePlayerData(player, effectivePending);
+    }
+
+    private CheckpointCapture<CompletePlayerData> captureCheckpointOnServerThread(
+        MinecraftServer server,
+        ServerPlayerEntity player,
+        PlayerSessionContext context
+    ) {
+        if (server == null || !server.isOnThread()) {
+            throw new IllegalStateException("Checkpoint epoch capture requires the Minecraft server thread");
+        }
+        context.observeChangesOnServerThread(player, config.sync);
+        return CheckpointCapture.capture(context::checkpointChangeVersion,
+            () -> extractLiveCheckpointOnServerThread(server, player, context.pendingDisconnectItemsJson()));
     }
 
     private CompletePlayerData extractCompletePlayerData(

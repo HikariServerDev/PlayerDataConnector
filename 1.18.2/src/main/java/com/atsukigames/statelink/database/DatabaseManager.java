@@ -16,6 +16,7 @@ public final class DatabaseManager {
     private static final Logger LOGGER = LoggerFactory.getLogger(DatabaseManager.class);
 
     private final HikariDataSource dataSource;
+    private final HikariDataSource leaseRenewalDataSource;
     private final String tableName;
     private final String coordinationTableName;
     private final int queryTimeoutSeconds;
@@ -103,6 +104,28 @@ public final class DatabaseManager {
         hikariConfig.setLeakDetectionThreshold(60000);
 
         this.dataSource = new HikariDataSource(hikariConfig);
+        HikariConfig renewalPoolConfig = new HikariConfig();
+        renewalPoolConfig.setPoolName("StateLink-lease-renewal");
+        renewalPoolConfig.setJdbcUrl(jdbcUrl);
+        renewalPoolConfig.setUsername(config.username);
+        renewalPoolConfig.setPassword(config.password);
+        renewalPoolConfig.setMaximumPoolSize(config.leaseRenewalPoolSize);
+        renewalPoolConfig.setMinimumIdle(1);
+        renewalPoolConfig.setConnectionTimeout(config.connectionTimeoutMs);
+        renewalPoolConfig.setConnectionInitSql("SET SESSION innodb_lock_wait_timeout = " + lockWaitSeconds);
+        renewalPoolConfig.setIdleTimeout(600000);
+        renewalPoolConfig.setMaxLifetime(1800000);
+        renewalPoolConfig.setLeakDetectionThreshold(60000);
+        HikariDataSource renewalDataSource;
+        try {
+            renewalDataSource = new HikariDataSource(renewalPoolConfig);
+        } catch (RuntimeException failure) {
+            // Pool construction eagerly opens its minimum-idle connection. If it fails,
+            // do not leak the already-created general pool's housekeeper/connection.
+            dataSource.close();
+            throw failure;
+        }
+        this.leaseRenewalDataSource = renewalDataSource;
         this.databaseName = config.name;
         this.tableName = config.tableName;
         this.queryTimeoutSeconds = Math.max(1, config.queryTimeoutMs / 1_000);
@@ -123,6 +146,8 @@ public final class DatabaseManager {
             dataSource.getMaximumPoolSize(), dataSource.getMinimumIdle(), dataSource.getConnectionTimeout(),
             dataSource.getValidationTimeout(), dataSource.getIdleTimeout(), dataSource.getMaxLifetime(),
             diagnosticLogging);
+        LOGGER.info("Lease renewal uses reserved Hikari pool maximumPoolSize={} (additional to general pool)",
+            leaseRenewalDataSource.getMaximumPoolSize());
 
         try {
             // Never alter an existing engine. The repository's atomic transactions
@@ -130,12 +155,18 @@ public final class DatabaseManager {
             initializeSchema(legacyBootstrap);
         } catch (RuntimeException failure) {
             dataSource.close();
+            leaseRenewalDataSource.close();
             throw failure;
         }
     }
 
     public Connection getConnection() throws SQLException {
         return dataSource.getConnection();
+    }
+
+    /** Reserved connection capacity for lease control; bulk PlayerData work cannot consume it. */
+    public Connection getLeaseRenewalConnection() throws SQLException {
+        return leaseRenewalDataSource.getConnection();
     }
 
     /**
@@ -147,6 +178,10 @@ public final class DatabaseManager {
         PreparedStatement statement = connection.prepareStatement(sql);
         statement.setQueryTimeout(queryTimeoutSeconds);
         return statement;
+    }
+
+    public PreparedStatement prepareLeaseRenewalStatement(Connection connection, String sql) throws SQLException {
+        return prepareStatement(connection, sql);
     }
 
     public boolean isDiagnosticLoggingEnabled() {
@@ -171,8 +206,16 @@ public final class DatabaseManager {
     }
 
     public PoolMetrics poolMetrics() {
-        if (dataSource.isClosed()) return PoolMetrics.unavailable();
-        HikariPoolMXBean bean = dataSource.getHikariPoolMXBean();
+        return metrics(dataSource);
+    }
+
+    public PoolMetrics leaseRenewalPoolMetrics() {
+        return metrics(leaseRenewalDataSource);
+    }
+
+    private static PoolMetrics metrics(HikariDataSource source) {
+        if (source == null || source.isClosed()) return PoolMetrics.unavailable();
+        HikariPoolMXBean bean = source.getHikariPoolMXBean();
         if (bean == null) return PoolMetrics.unavailable();
         return new PoolMetrics(
             bean.getActiveConnections(),
@@ -217,7 +260,7 @@ public final class DatabaseManager {
     }
 
     public boolean isClosed() {
-        return dataSource.isClosed();
+        return dataSource.isClosed() && leaseRenewalDataSource.isClosed();
     }
 
     /** Schema generation observed before this process applied any DDL. */
@@ -1000,6 +1043,16 @@ public final class DatabaseManager {
         ensureColumn(coordinationTableName, "domain_provenance_revision", "BIGINT UNSIGNED NULL", "domain provenance data revision");
         ensureColumn(coordinationTableName, "domain_provenance_generation", "BIGINT UNSIGNED NULL", "domain provenance generation");
         ensureColumn(coordinationTableName, "domain_provenance_manifest", "LONGTEXT NULL", "domain provenance state manifest");
+        ensureColumn(coordinationTableName, "checkpoint_state_digest", "CHAR(64) NULL", "canonical durable state digest");
+        ensureColumn(coordinationTableName, "verified_state_server", "VARCHAR(64) NULL", "verified-state source server");
+        ensureColumn(coordinationTableName, "verified_state_session", "CHAR(36) NULL", "verified-state source session");
+        ensureColumn(coordinationTableName, "verified_state_fence", "BIGINT UNSIGNED NULL", "verified-state ownership fence");
+        ensureColumn(coordinationTableName, "verified_state_revision", "BIGINT UNSIGNED NULL", "verified-state checkpoint revision");
+        ensureColumn(coordinationTableName, "verified_state_provenance_generation", "BIGINT UNSIGNED NULL", "verified-state provenance generation");
+        ensureColumn(coordinationTableName, "verified_state_provenance_manifest", "LONGTEXT NULL", "verified-state provenance manifest");
+        ensureColumn(coordinationTableName, "verified_state_domains", "LONGTEXT NULL", "verified-state enabled-domain manifest");
+        ensureColumn(coordinationTableName, "verified_state_digest", "CHAR(64) NULL", "verified-state snapshot digest");
+        ensureColumn(coordinationTableName, "verified_state_at", "DATETIME(6) NULL", "verified-state database timestamp");
         validateColumn(coordinationTableName, "clean_release_session", "char", true, 36,
             null, null, true, null, null);
         validateColumn(coordinationTableName, "clean_release_fence", "bigint", true, 0,
@@ -1016,6 +1069,16 @@ public final class DatabaseManager {
             true, null, true, null, null);
         validateColumn(coordinationTableName, "domain_provenance_manifest", "longtext", true, 0,
             null, null, true, null, null);
+        validateColumn(coordinationTableName, "checkpoint_state_digest", "char", true, 64, null, null, true, null, null);
+        validateColumn(coordinationTableName, "verified_state_server", "varchar", true, 64, null, null, true, null, null);
+        validateColumn(coordinationTableName, "verified_state_session", "char", true, 36, null, null, true, null, null);
+        validateColumn(coordinationTableName, "verified_state_fence", "bigint", true, 0, true, null, true, null, null);
+        validateColumn(coordinationTableName, "verified_state_revision", "bigint", true, 0, true, null, true, null, null);
+        validateColumn(coordinationTableName, "verified_state_provenance_generation", "bigint", true, 0, true, null, true, null, null);
+        validateColumn(coordinationTableName, "verified_state_provenance_manifest", "longtext", true, 0, null, null, true, null, null);
+        validateColumn(coordinationTableName, "verified_state_domains", "longtext", true, 0, null, null, true, null, null);
+        validateColumn(coordinationTableName, "verified_state_digest", "char", true, 64, null, null, true, null, null);
+        validateColumn(coordinationTableName, "verified_state_at", "datetime", true, 0, null, null, true, 6, null);
         migrateLegacyDomainProvenance();
         validateColumn(tableName, "advancements", "longtext", true, 0);
         validateColumn(tableName, "statistics", "longtext", true, 0);
@@ -1288,6 +1351,9 @@ public final class DatabaseManager {
     public void close() {
         if (dataSource != null && !dataSource.isClosed()) {
             dataSource.close();
+        }
+        if (leaseRenewalDataSource != null && !leaseRenewalDataSource.isClosed()) {
+            leaseRenewalDataSource.close();
         }
     }
 }

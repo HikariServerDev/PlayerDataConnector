@@ -7,10 +7,14 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -26,6 +30,7 @@ public final class PlayerDataRepository {
     public static final long NO_LEASE_ANCHOR = Long.MIN_VALUE;
     private final DatabaseManager db;
     private final TransactionFaultInjector transactionFaultInjector;
+    private final AtomicLong renewalCommitUnknownCount = new AtomicLong();
 
     public PlayerDataRepository(DatabaseManager db) {
         this(db, (ignoredPhase, ignoredFinalFlush) -> { });
@@ -47,7 +52,9 @@ public final class PlayerDataRepository {
         AFTER_PLAYER_DATA_WRITE,
         AFTER_OWNERSHIP_UPDATE,
         BEFORE_COMMIT,
-        AFTER_COMMIT
+        AFTER_COMMIT,
+        BEFORE_RENEWAL_COMMIT,
+        AFTER_RENEWAL_COMMIT
     }
 
     @FunctionalInterface
@@ -125,6 +132,14 @@ public final class PlayerDataRepository {
         FENCED
     }
 
+    public enum StateAttestationStatus {
+        ATTESTED, DATA_CHANGED, FENCED, REVISION_MISMATCH, PROVENANCE_UNKNOWN, CHECKPOINT_INTEGRITY_MISMATCH
+    }
+
+    public record StateAttestationResult(StateAttestationStatus status, long revision, String digest) {}
+
+    public long renewalCommitUnknownCount() { return renewalCommitUnknownCount.get(); }
+
     public record SaveResult(SaveStatus status, long dataRevision, long leaseAnchorNanos) {
         public boolean committed() {
             return status == SaveStatus.COMMITTED;
@@ -190,6 +205,12 @@ public final class PlayerDataRepository {
 
     public record LeaseRenewalResult(boolean renewed, long leaseAnchorNanos) {}
 
+    private static final class RenewalCommitUnknownException extends SQLException {
+        RenewalCommitUnknownException(SQLException cause) {
+            super("lease renewal COMMIT outcome is unknown", cause.getSQLState(), cause.getErrorCode(), cause);
+        }
+    }
+
     public enum RecoveryAcknowledgement {
         SOURCE_FENCED_AND_WORLD_REVIEWED, UNSAFE_AUTOMATIC_LAST_CHECKPOINT_ACCEPTED,
         AUTOMATIC_LAST_CHECKPOINT_RISK_ACCEPTED
@@ -213,7 +234,8 @@ public final class PlayerDataRepository {
     private void writeDomainProvenance(Connection connection, UUID uuid, DomainProvenance provenance)
         throws SQLException {
         String sql = "UPDATE " + db.getCoordinationTableName()
-            + " SET domain_provenance_revision=?,domain_provenance_generation=?,domain_provenance_manifest=? WHERE uuid=?";
+            + " SET domain_provenance_revision=?,domain_provenance_generation=?,domain_provenance_manifest=?,"
+            + verifiedStateClearAssignments() + " WHERE uuid=?";
         try (PreparedStatement update = db.prepareStatement(connection, sql)) {
             update.setLong(1, provenance.dataRevision());
             update.setLong(2, provenance.generation());
@@ -223,8 +245,32 @@ public final class PlayerDataRepository {
         }
     }
 
+    private static String verifiedStateClearAssignments() {
+        return "verified_state_server=NULL,verified_state_session=NULL,verified_state_fence=NULL,"
+            + "verified_state_revision=NULL,verified_state_provenance_generation=NULL,"
+            + "verified_state_provenance_manifest=NULL,verified_state_domains=NULL,verified_state_digest=NULL,"
+            + "verified_state_at=NULL";
+    }
+
+    private void writeCheckpointStateDigest(Connection connection, UUID uuid, long revision, String digest)
+        throws SQLException {
+        String sql = "UPDATE " + db.getCoordinationTableName() + " SET checkpoint_state_digest=?,"
+            + verifiedStateClearAssignments() + " WHERE uuid=? AND data_revision=?";
+        try (PreparedStatement update = db.prepareStatement(connection, sql)) {
+            update.setString(1, digest);
+            update.setString(2, uuid.toString());
+            update.setLong(3, revision);
+            if (update.executeUpdate() != 1) throw new SQLException("checkpoint digest revision changed during SAVE");
+        }
+    }
+
     private SaveResult verifiedFinalReceipt(Connection connection, CompletePlayerData data,
         Ownership ownership, Configuration.SyncConfig sync) throws SQLException {
+        return verifiedFinalReceipt(connection, data, ownership, sync, -1L);
+    }
+
+    private SaveResult verifiedFinalReceipt(Connection connection, CompletePlayerData data,
+        Ownership ownership, Configuration.SyncConfig sync, long expectedRevision) throws SQLException {
         try (PreparedStatement query = db.prepareStatement(connection, "SELECT clean_release_session, "
                 + "clean_release_fence,clean_release_revision,clean_release_digest FROM "
                 + db.getCoordinationTableName() + " WHERE uuid=?")) {
@@ -232,6 +278,7 @@ public final class PlayerDataRepository {
             try (ResultSet row = query.executeQuery()) {
                 if (row.next() && ownership.ownerSession().toString().equals(row.getString(1))
                         && ownership.fencingToken() == row.getLong(2)
+                        && (expectedRevision < 0 || expectedRevision == row.getLong(3))
                         && com.atsukigames.statelink.utils.CheckpointDigest.digest(data, sync).equals(row.getString(4))) {
                     return new SaveResult(SaveStatus.COMMITTED, row.getLong(3), NO_LEASE_ANCHOR);
                 }
@@ -240,7 +287,7 @@ public final class PlayerDataRepository {
         return null;
     }
     public enum RecoveryResolutionStatus { RESOLVED, ALREADY_RESOLVED, CONFLICT, NOT_RECOVERY_REQUIRED,
-        WAITING, STALE_CHECKPOINT, ATTEMPTS_EXHAUSTED, ATTEMPT_RESERVED, DOMAIN_STILL_REQUIRES_RECONCILIATION }
+        WAITING, STALE_CHECKPOINT, MISSING_CHECKPOINT, ATTEMPTS_EXHAUSTED, ATTEMPT_RESERVED, DOMAIN_STILL_REQUIRES_RECONCILIATION }
     public record RecoveryResolutionResult(RecoveryResolutionStatus status, long fence, long revision) {}
 
     /** Explicit operator decision to adopt the currently stored DB value for one domain. */
@@ -499,7 +546,8 @@ public final class PlayerDataRepository {
                 }
                 long nextFence = Math.addExact(row.fencingToken, 1);
                 try (PreparedStatement update = db.prepareStatement(connection, "UPDATE " + db.getCoordinationTableName()
-                        + " SET recovery_required=FALSE,recovery_reason=NULL,recovery_required_at=NULL,fencing_token=? WHERE uuid=?")) {
+                        + " SET recovery_required=FALSE,recovery_reason=NULL,recovery_required_at=NULL,fencing_token=?,"
+                        + verifiedStateClearAssignments() + " WHERE uuid=?")) {
                     update.setLong(1, nextFence);
                     update.setString(2, uuid.toString());
                     update.executeUpdate();
@@ -541,17 +589,79 @@ public final class PlayerDataRepository {
     public RecoveryResolutionResult resolveAutomaticLastCheckpoint(UUID uuid, long fence, long revision,
         UUID operation, String actor, int delaySeconds, int maxAgeSeconds, int legacyMaxAgeSeconds, int maxAttempts,
         int retrySeconds, boolean acknowledged) throws SQLException {
+        return resolveAutomaticLastCheckpoint(uuid, fence, revision, operation, actor, delaySeconds,
+            maxAgeSeconds, legacyMaxAgeSeconds, 120, maxAttempts, retrySeconds, acknowledged,
+            new Configuration.SyncConfig());
+    }
+
+    public RecoveryResolutionResult resolveAutomaticLastCheckpoint(UUID uuid, long fence, long revision,
+        UUID operation, String actor, int delaySeconds, int maxAgeSeconds, int legacyMaxAgeSeconds,
+        int maxVerifiedStateAgeSeconds, int maxAttempts, int retrySeconds, boolean acknowledged,
+        Configuration.SyncConfig sync) throws SQLException {
         if (!acknowledged || delaySeconds < 0) throw new IllegalArgumentException("automatic rollback/duplication acknowledgement required");
+        if (sync == null) throw new IllegalArgumentException("current sync-domain configuration is required");
         return resolveRecovery(uuid, fence, revision, operation, actor,
             RecoveryAcknowledgement.AUTOMATIC_LAST_CHECKPOINT_RISK_ACCEPTED, null, null, delaySeconds,
-            new AutomaticLimits(maxAgeSeconds,legacyMaxAgeSeconds,maxAttempts,retrySeconds));
+            new AutomaticLimits(maxAgeSeconds, legacyMaxAgeSeconds, maxVerifiedStateAgeSeconds,
+                maxAttempts, retrySeconds, sync));
     }
 
     /** Bounds repeated deferral logging per player; see {@link DeferralLog}. */
     private final DeferralLog deferralLog = new DeferralLog(60_000L);
 
-    private record AutomaticLimits(int maxAgeSeconds,int legacyMaxAgeSeconds,int maxAttempts,int retrySeconds) {
-        AutomaticLimits { if(maxAgeSeconds<=0 || legacyMaxAgeSeconds<=0 || maxAttempts<=0 || retrySeconds<=0) throw new IllegalArgumentException("positive automatic recovery limits required"); }
+    private record AutomaticLimits(int maxAgeSeconds, int legacyMaxAgeSeconds, int maxVerifiedStateAgeSeconds,
+        int maxAttempts, int retrySeconds, Configuration.SyncConfig sync) {
+        AutomaticLimits {
+            if (maxAgeSeconds <= 0 || legacyMaxAgeSeconds <= 0 || maxVerifiedStateAgeSeconds <= 0
+                    || maxAttempts <= 0 || retrySeconds <= 0 || sync == null) {
+                throw new IllegalArgumentException("positive automatic recovery limits and sync config required");
+            }
+        }
+    }
+
+    private record VerifiedStateCheck(boolean valid, boolean present, long ageMs, String reason) {
+        static VerifiedStateCheck notNeeded() { return new VerifiedStateCheck(false, false, Long.MAX_VALUE, "checkpoint-fresh"); }
+    }
+
+    /** Verify an attestation against current row identity, provenance, and actual stored PlayerData. */
+    private VerifiedStateCheck verifyRecentStateAttestation(Connection connection, UUID uuid, SyncRow row,
+        Timestamp dbNow, AutomaticLimits limits) throws SQLException {
+        if (row.verifiedStateAt == null) return new VerifiedStateCheck(false, false, Long.MAX_VALUE, "missing");
+        Timestamp failure = RecoveryFreshness.failureReference(dbNow, row.recoveryRequiredAt, row.leaseUntil);
+        long age = dbNow.getTime() - row.verifiedStateAt.getTime();
+        if (!RecoveryFreshness.eligible(row.verifiedStateAt, dbNow, failure, limits.maxVerifiedStateAgeSeconds)) {
+            return new VerifiedStateCheck(false, true, age, "stale");
+        }
+        if (row.ownerServer == null || row.ownerSession == null
+                || !row.ownerServer.equals(row.verifiedStateServer)
+                || !row.ownerSession.equals(row.verifiedStateSession)
+                || row.verifiedStateFence == null || row.verifiedStateFence != row.fencingToken) {
+            return new VerifiedStateCheck(false, true, age, "owner-or-fence-mismatch");
+        }
+        if (row.verifiedStateRevision == null || row.verifiedStateRevision != row.dataRevision
+                || row.verifiedStateDigest == null || row.checkpointStateDigest == null
+                || !row.verifiedStateDigest.equals(row.checkpointStateDigest)) {
+            return new VerifiedStateCheck(false, true, age, "checkpoint-revision-or-digest-mismatch");
+        }
+        if (row.domainProvenanceGeneration == null || row.verifiedStateProvenanceGeneration == null
+                || !row.domainProvenanceGeneration.equals(row.verifiedStateProvenanceGeneration)
+                || !java.util.Objects.equals(row.domainProvenanceManifest, row.verifiedStateProvenanceManifest)
+                || !java.util.Objects.equals(com.atsukigames.statelink.utils.CheckpointDigest.domains(limits.sync),
+                    row.verifiedStateDomains)) {
+            return new VerifiedStateCheck(false, true, age, "domain-provenance-or-config-mismatch");
+        }
+        DomainProvenance provenance = DomainProvenance.read(row.domainProvenanceManifest,
+            row.domainProvenanceRevision, row.domainProvenanceGeneration, row.dataRevision);
+        if (!provenance.authorizesEnabledDomains(limits.sync)) {
+            return new VerifiedStateCheck(false, true, age, "domain-provenance-not-authoritative");
+        }
+        CompletePlayerData durable = loadCompletePlayerData(connection, uuid).orElse(null);
+        if (durable == null) return new VerifiedStateCheck(false, true, age, "player-data-missing");
+        String actual = com.atsukigames.statelink.utils.CheckpointDigest.verifiedStateDigest(durable, limits.sync);
+        if (!actual.equals(row.verifiedStateDigest)) {
+            return new VerifiedStateCheck(false, true, age, "stored-data-digest-mismatch");
+        }
+        return new VerifiedStateCheck(true, true, age, "valid");
     }
 
     /**
@@ -745,23 +855,39 @@ public final class PlayerDataRepository {
                 if (row.leaseUntil != null && (since == null || row.leaseUntil.after(since))) since = row.leaseUntil;
                 if (unsafeAutomatic && (!row.recoveryRequired || (!unowned && !expiredOwner)
                         || !RecoveryPolicy.allowsAutomatic(row.recoveryReason)
-                        || since == null || dbNow.getTime() - since.getTime() < delaySeconds * 1000L
-                        || row.lastCheckpointAt == null || row.dataRevision <= 0
-                        || loadCompletePlayerData(connection, uuid).isEmpty())) {
+                        || since == null || dbNow.getTime() - since.getTime() < delaySeconds * 1000L)) {
                     connection.rollback();
                     return new RecoveryResolutionResult(RecoveryResolutionStatus.CONFLICT, row.fencingToken, row.dataRevision);
+                }
+                if (unsafeAutomatic && (row.dataRevision <= 0 || loadCompletePlayerData(connection, uuid).isEmpty())) {
+                    // A failed first login is not a saved checkpoint. Never loop promising that
+                    // retrying can create the missing data, and never fabricate an empty PlayerData.
+                    connection.rollback();
+                    return new RecoveryResolutionResult(RecoveryResolutionStatus.MISSING_CHECKPOINT,
+                        row.fencingToken, row.dataRevision);
                 }
                 if (limits != null) {
                     // Eligibility first, attempt accounting last: a policy deferral (stale checkpoint,
                     // retry interval, delay, live owner) must never spend the bounded attempt budget.
                     boolean legacyCheckpoint = isLegacyBootstrapCheckpoint(connection, row);
                     int maxAgeSeconds = legacyCheckpoint ? limits.legacyMaxAgeSeconds : limits.maxAgeSeconds;
-                    long age=dbNow.getTime()-row.lastCheckpointAt.getTime();
-                    if (age<0 || age>maxAgeSeconds*1000L) {
+                    long age = row.lastCheckpointAt == null ? Long.MAX_VALUE
+                        : dbNow.getTime() - row.lastCheckpointAt.getTime();
+                    Timestamp failure = RecoveryFreshness.failureReference(dbNow, row.recoveryRequiredAt, row.leaseUntil);
+                    boolean checkpointFresh = RecoveryFreshness.eligible(row.lastCheckpointAt, dbNow, failure, maxAgeSeconds);
+                    VerifiedStateCheck verified = checkpointFresh ? VerifiedStateCheck.notNeeded()
+                        : verifyRecentStateAttestation(connection, uuid, row, dbNow, limits);
+                    if (!checkpointFresh && !verified.valid()) {
                         connection.rollback();
-                        long deferrals = deferralLog.permit(uuid, "STALE:" + row.fencingToken + ":" + row.dataRevision + ":" + maxAgeSeconds);
-                        if (deferrals > 0) LOGGER.warn("Automatic recovery deferred: checkpoint too old uuid={} ageMs={} maxAgeSeconds={} policy={} deferrals={}; RECOVERY_REQUIRED retained, attempt budget unchanged",
-                            uuid,age,maxAgeSeconds,legacyCheckpoint ? "legacy-2.1.11-backlog" : "normal",deferrals);
+                        long deferrals = deferralLog.permit(uuid, "STALE:" + row.fencingToken + ":" + row.dataRevision
+                            + ":" + maxAgeSeconds + ":" + verified.reason());
+                        if (deferrals > 0) LOGGER.warn("Automatic recovery deferred: no fresh checkpoint or valid state attestation uuid={} "
+                                + "checkpointAgeMs={} maxCheckpointAgeSeconds={} verifiedAgeMs={} maxVerifiedStateAgeSeconds={} "
+                                + "attestationPresent={} attestationReason={} policy={} fence={} revision={} deferrals={} failureReference={}; "
+                                + "RECOVERY_REQUIRED retained, attempt budget unchanged",
+                            uuid, age, maxAgeSeconds, verified.ageMs(), limits.maxVerifiedStateAgeSeconds,
+                            verified.present(), verified.reason(), legacyCheckpoint ? "legacy-2.1.11-backlog" : "normal",
+                            row.fencingToken, row.dataRevision, deferrals, failure);
                         return new RecoveryResolutionResult(RecoveryResolutionStatus.STALE_CHECKPOINT,row.fencingToken,row.dataRevision);
                     }
                     if (!attemptReserved && row.automaticAttempts >= limits.maxAttempts) {
@@ -794,6 +920,7 @@ public final class PlayerDataRepository {
                     + " SET owner_server=NULL, owner_session=NULL, lease_until=NULL, fencing_token=?, "
                     + "data_revision=?, recovery_required=FALSE, recovery_reason=NULL, recovery_required_at=NULL,"
                     + "automatic_recovery_attempts=0,automatic_recovery_last_attempt_at=NULL"
+                    + "," + verifiedStateClearAssignments()
                     + (source == null ? "" : ", last_checkpoint_at=CURRENT_TIMESTAMP(6)") + " WHERE uuid=?";
                 try (PreparedStatement statement = db.prepareStatement(connection, update)) {
                     statement.setLong(1, nextFence);
@@ -803,6 +930,8 @@ public final class PlayerDataRepository {
                 }
                 DomainProvenance resolvedProvenance = null;
                 if (source != null) {
+                    writeCheckpointStateDigest(connection, uuid, nextRevision,
+                        com.atsukigames.statelink.utils.CheckpointDigest.verifiedStateDigest(source, sync));
                     DomainProvenance prior = DomainProvenance.read(row.domainProvenanceManifest,
                         row.domainProvenanceRevision, row.domainProvenanceGeneration, row.dataRevision);
                     resolvedProvenance = prior.atRevision(sync, nextRevision);
@@ -1084,6 +1213,103 @@ public final class PlayerDataRepository {
         return null;
     }
 
+    /**
+     * Persists only a verification timestamp and identity after a current server-thread snapshot
+     * is compared with the durable PlayerData. It never advances data_revision or rewrites a LOB.
+     */
+    public StateAttestationResult attestVerifiedState(CompletePlayerData liveSnapshot, Ownership owner,
+        Configuration.SyncConfig sync, long capturedAtNanos, long capturedChangeVersion,
+        LongSupplier currentChangeVersion) throws SQLException {
+        if (liveSnapshot == null || owner == null || sync == null || !liveSnapshot.uuid.equals(owner.uuid())) {
+            throw new IllegalArgumentException("snapshot, owner, and sync configuration must match");
+        }
+        if (capturedAtNanos <= 0 || currentChangeVersion == null) {
+            throw new IllegalArgumentException("attestation requires a captured epoch and monotonic timestamp");
+        }
+        String liveDigest = com.atsukigames.statelink.utils.CheckpointDigest.verifiedStateDigest(liveSnapshot, sync);
+        try (Connection connection = db.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                SyncRow row = lockSyncRow(connection, owner.uuid());
+                Timestamp dbNow = currentDatabaseTime(connection);
+                long dbNowObservedAtNanos = System.nanoTime();
+                if (!matchesLiveOwnership(row, owner, dbNow)) {
+                    connection.rollback();
+                    return new StateAttestationResult(StateAttestationStatus.FENCED, row.dataRevision, null);
+                }
+                DomainProvenance provenance = DomainProvenance.read(row.domainProvenanceManifest,
+                    row.domainProvenanceRevision, row.domainProvenanceGeneration, row.dataRevision);
+                if (!provenance.authorizesEnabledDomains(sync) || row.domainProvenanceGeneration == null
+                        || row.domainProvenanceManifest == null) {
+                    connection.rollback();
+                    return new StateAttestationResult(StateAttestationStatus.PROVENANCE_UNKNOWN, row.dataRevision, null);
+                }
+                CompletePlayerData durable = loadCompletePlayerData(connection, owner.uuid()).orElse(null);
+                if (durable == null) {
+                    connection.rollback();
+                    return new StateAttestationResult(StateAttestationStatus.DATA_CHANGED, row.dataRevision, null);
+                }
+                String durableDigest = com.atsukigames.statelink.utils.CheckpointDigest.verifiedStateDigest(durable, sync);
+                if (!liveDigest.equals(durableDigest)) {
+                    connection.rollback();
+                    return new StateAttestationResult(StateAttestationStatus.DATA_CHANGED, row.dataRevision, liveDigest);
+                }
+                if (row.checkpointStateDigest != null && !row.checkpointStateDigest.equals(durableDigest)) {
+                    connection.rollback();
+                    return new StateAttestationResult(StateAttestationStatus.CHECKPOINT_INTEGRITY_MISMATCH,
+                        row.dataRevision, durableDigest);
+                }
+                if (currentChangeVersion.getAsLong() != capturedChangeVersion) {
+                    connection.rollback();
+                    return new StateAttestationResult(StateAttestationStatus.DATA_CHANGED, row.dataRevision, liveDigest);
+                }
+                Timestamp conservativeVerifiedAt = VerifiedStateTimestamp.atOrBeforeCapture(
+                    dbNow, capturedAtNanos, dbNowObservedAtNanos);
+                String sql = "UPDATE " + db.getCoordinationTableName() + " SET checkpoint_state_digest=?,"
+                    + "verified_state_server=?,verified_state_session=?,verified_state_fence=?,"
+                    + "verified_state_revision=?,verified_state_provenance_generation=?,"
+                    + "verified_state_provenance_manifest=?,verified_state_domains=?,verified_state_digest=?,"
+                    + "verified_state_at=LEAST(?,CURRENT_TIMESTAMP(6)) WHERE uuid=? AND data_revision=? "
+                    + "AND owner_server=? AND owner_session=? AND fencing_token=? "
+                    + "AND lease_until>=CURRENT_TIMESTAMP(6) AND recovery_required=FALSE";
+                try (PreparedStatement update = db.prepareStatement(connection, sql)) {
+                    update.setString(1, durableDigest);
+                    update.setString(2, owner.ownerServer());
+                    update.setString(3, owner.ownerSession().toString());
+                    update.setLong(4, owner.fencingToken());
+                    update.setLong(5, row.dataRevision);
+                    update.setLong(6, row.domainProvenanceGeneration);
+                    update.setString(7, row.domainProvenanceManifest);
+                    update.setString(8, com.atsukigames.statelink.utils.CheckpointDigest.domains(sync));
+                    update.setString(9, durableDigest);
+                    update.setTimestamp(10, conservativeVerifiedAt);
+                    update.setString(11, owner.uuid().toString());
+                    update.setLong(12, row.dataRevision);
+                    update.setString(13, owner.ownerServer());
+                    update.setString(14, owner.ownerSession().toString());
+                    update.setLong(15, owner.fencingToken());
+                    if (update.executeUpdate() != 1) {
+                        connection.rollback();
+                        return new StateAttestationResult(StateAttestationStatus.FENCED, row.dataRevision, null);
+                    }
+                }
+                if (currentChangeVersion.getAsLong() != capturedChangeVersion) {
+                    connection.rollback();
+                    return new StateAttestationResult(StateAttestationStatus.DATA_CHANGED, row.dataRevision, liveDigest);
+                }
+                connection.commit();
+                return new StateAttestationResult(StateAttestationStatus.ATTESTED, row.dataRevision, durableDigest);
+            } catch (Throwable error) {
+                try { connection.rollback(); } catch (SQLException rollbackError) { error.addSuppressed(rollbackError); }
+                if (error instanceof SQLException sqlException) throw sqlException;
+                if (error instanceof RuntimeException runtimeException) throw runtimeException;
+                throw new SQLException("Failed to attest unchanged PlayerData checkpoint", error);
+            } finally {
+                connection.setAutoCommit(true);
+            }
+        }
+    }
+
     /** Compatibility wrapper for callers that only need the fencing result. */
     public boolean renewLease(Ownership ownership, long leaseDurationMs) throws SQLException {
         return renewLeaseWithResult(ownership, leaseDurationMs).renewed();
@@ -1095,10 +1321,27 @@ public final class PlayerDataRepository {
      * at statement start while that statement waits for the lock.
      */
     public LeaseRenewalResult renewLeaseWithResult(Ownership ownership, long leaseDurationMs) throws SQLException {
+        return renewLeaseWithResult(ownership, leaseDurationMs, Long.MAX_VALUE);
+    }
+
+    /** The deadline is derived from the last conservative monotonic lease anchor. */
+    public LeaseRenewalResult renewLeaseWithResult(Ownership ownership, long leaseDurationMs,
+        long localSafetyDeadlineNanos) throws SQLException {
         SQLException lastError = null;
         for (int attempt = 0; attempt < 3; attempt++) {
+            if (System.nanoTime() >= localSafetyDeadlineNanos) {
+                throw new SQLException("local lease safety deadline expired before renewal attempt");
+            }
             try {
                 return renewLeaseOnce(ownership, leaseDurationMs);
+            } catch (RenewalCommitUnknownException unknown) {
+                LOGGER.warn("Lease renewal COMMIT outcome unknown; revalidating on a fresh reserved connection uuid={} session={} fence={} attempt={}",
+                    ownership.uuid(), ownership.ownerSession(), ownership.fencingToken(), attempt + 1);
+                if (System.nanoTime() >= localSafetyDeadlineNanos) throw unknown;
+                LeaseRenewalResult revalidated = revalidateRenewedLease(ownership, leaseDurationMs,
+                    localSafetyDeadlineNanos);
+                if (revalidated.renewed()) return revalidated;
+                return revalidated;
             } catch (SQLException error) {
                 lastError = error;
                 if (!isRetryableTransactionError(error) || attempt == 2) throw error;
@@ -1109,6 +1352,58 @@ public final class PlayerDataRepository {
         throw lastError == null ? new SQLException("lease renewal retry failed") : lastError;
     }
 
+    /** Rechecks exact session/fence and live DB lease after a lost COMMIT response. */
+    private LeaseRenewalResult revalidateRenewedLease(Ownership ownership, long leaseDurationMs,
+        long localSafetyDeadlineNanos) throws SQLException {
+        long started = System.nanoTime();
+        if (started >= localSafetyDeadlineNanos) throw new SQLException("lease revalidation started after local safety deadline");
+        try (Connection connection = db.getLeaseRenewalConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                SyncRow row = lockSyncRow(connection, ownership.uuid());
+                Timestamp dbNow = currentDatabaseTime(connection);
+                long sampledNanos = System.nanoTime();
+                if (!matchesLiveOwnership(row, ownership, dbNow) || row.leaseUntil == null) {
+                    connection.rollback();
+                    return new LeaseRenewalResult(false, NO_LEASE_ANCHOR);
+                }
+                long dbRemainingNanos = Math.max(0L,
+                    Duration.between(dbNow.toInstant(), row.leaseUntil.toInstant()).toNanos());
+                long roundTripNanos = Math.max(0L, sampledNanos - started);
+                long conservativeRemaining = Math.max(0L,
+                    dbRemainingNanos - roundTripNanos - TimeUnit.MILLISECONDS.toNanos(1));
+                long requiredSafety = localSafetyDeadlineNanos == Long.MAX_VALUE ? 0L
+                    : Math.max(0L, localSafetyDeadlineNanos - started);
+                if (conservativeRemaining <= 0 || (requiredSafety > 0 && conservativeRemaining < requiredSafety)) {
+                    connection.rollback();
+                    return new LeaseRenewalResult(false, NO_LEASE_ANCHOR);
+                }
+                connection.rollback(); // read-only lock transaction; no ownership extension is implied
+                long conservativeElapsed = Math.max(0L, TimeUnit.MILLISECONDS.toNanos(leaseDurationMs)
+                    - dbRemainingNanos + roundTripNanos + TimeUnit.MILLISECONDS.toNanos(1));
+                long anchor = sampledNanos - conservativeElapsed;
+                if (System.nanoTime() >= localSafetyDeadlineNanos) {
+                    return new LeaseRenewalResult(false, NO_LEASE_ANCHOR);
+                }
+                LOGGER.info("Lease renewal COMMIT was revalidated uuid={} session={} fence={} revision={} "
+                        + "dbRemainingMs={} revalidationMs={} poolActive={} poolIdle={} poolTotal={} poolWaiting={}",
+                    ownership.uuid(), ownership.ownerSession(), ownership.fencingToken(), row.dataRevision,
+                    TimeUnit.NANOSECONDS.toMillis(conservativeRemaining),
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+                    db.leaseRenewalPoolMetrics().active(), db.leaseRenewalPoolMetrics().idle(),
+                    db.leaseRenewalPoolMetrics().total(), db.leaseRenewalPoolMetrics().waiting());
+                return new LeaseRenewalResult(true, anchor);
+            } catch (Throwable error) {
+                try { connection.rollback(); } catch (SQLException rollbackError) { error.addSuppressed(rollbackError); }
+                if (error instanceof SQLException sqlException) throw sqlException;
+                if (error instanceof RuntimeException runtimeException) throw runtimeException;
+                throw new SQLException("Lease revalidation failed", error);
+            } finally {
+                connection.setAutoCommit(true);
+            }
+        }
+    }
+
     private LeaseRenewalResult renewLeaseOnce(Ownership ownership, long leaseDurationMs) throws SQLException {
         long leaseMicros = leaseMicros(leaseDurationMs);
         String stateTable = db.getCoordinationTableName();
@@ -1117,7 +1412,7 @@ public final class PlayerDataRepository {
             ownership.fencingToken(), ownership.dataRevision());
         String outcome = "FAILURE";
         Throwable failure = null;
-        try (Connection connection = beginConnection(trace)) {
+        try (Connection connection = beginLeaseRenewalConnection(trace)) {
             try {
                 trace.start("transaction");
                 connection.setAutoCommit(false);
@@ -1142,7 +1437,14 @@ public final class PlayerDataRepository {
                     return new LeaseRenewalResult(false, NO_LEASE_ANCHOR);
                 }
                 trace.start("commit");
-                connection.commit();
+                transactionFaultInjector.at(TransactionPhase.BEFORE_RENEWAL_COMMIT, false);
+                try {
+                    connection.commit();
+                    transactionFaultInjector.at(TransactionPhase.AFTER_RENEWAL_COMMIT, false);
+                } catch (SQLException commitError) {
+                    renewalCommitUnknownCount.incrementAndGet();
+                    throw new RenewalCommitUnknownException(commitError);
+                }
                 trace.end("commit");
                 trace.end("transaction");
                 outcome = "RENEWED";
@@ -1184,6 +1486,34 @@ public final class PlayerDataRepository {
         for (int attempt = 0; attempt < 3; attempt++) {
             try {
                 return saveCompletePlayerDataOnce(data, ownership, sync, leaseDurationMs, finalFlush);
+            } catch (SaveCommitUnknownException unknown) {
+                lastError = unknown;
+                SaveRevalidation proof;
+                try {
+                    proof = revalidateSaveCommit(data, ownership, sync, leaseDurationMs, finalFlush,
+                        unknown.expectedRevision, unknown.expectedDigest);
+                } catch (SQLException verificationError) {
+                    unknown.addSuppressed(verificationError);
+                    throw unknown;
+                }
+                switch (proof.status()) {
+                    case COMMITTED -> {
+                        LOGGER.info("SAVE COMMIT outcome revalidated uuid={} final={} revision={} proof={}",
+                            data.uuid, finalFlush, proof.revision(), finalFlush ? "clean-receipt" : "durable-digest");
+                        return proof.result();
+                    }
+                    case FENCED -> {
+                        LOGGER.warn("SAVE COMMIT revalidation found lost authority uuid={} final={} revision={}",
+                            data.uuid, finalFlush, proof.revision());
+                        return new SaveResult(SaveStatus.FENCED, proof.revision(), NO_LEASE_ANCHOR);
+                    }
+                    case NOT_COMMITTED -> {
+                        if (attempt == 2) throw unknown;
+                        LOGGER.warn("SAVE COMMIT revalidation proved rollback; retrying immutable snapshot uuid={} attempt={}",
+                            data.uuid, attempt + 1);
+                    }
+                    case UNCERTAIN -> throw unknown;
+                }
             } catch (SQLException error) {
                 lastError = error;
                 if (!isRetryableTransactionError(error) || attempt == 2) throw error;
@@ -1193,6 +1523,108 @@ public final class PlayerDataRepository {
             }
         }
         throw lastError == null ? new SQLException("save transaction retry failed") : lastError;
+    }
+
+    private enum SaveRevalidationStatus { COMMITTED, NOT_COMMITTED, FENCED, UNCERTAIN }
+    private record SaveRevalidation(SaveRevalidationStatus status, SaveResult result, long revision) {}
+
+    private static final class SaveCommitUnknownException extends SQLException {
+        private final long expectedRevision;
+        private final String expectedDigest;
+
+        private SaveCommitUnknownException(SQLException cause, long expectedRevision, String expectedDigest) {
+            super("PlayerData SAVE COMMIT outcome is unknown", cause.getSQLState(), cause.getErrorCode(), cause);
+            this.expectedRevision = expectedRevision;
+            this.expectedDigest = expectedDigest;
+        }
+    }
+
+    /**
+     * Revalidate an uncertain COMMIT on a fresh primary connection. Retry is allowed only
+     * after the coordination lock proves the previous transaction absent; committed state
+     * is accepted only when revision, enabled-domain provenance and stored payload all match.
+     */
+    private SaveRevalidation revalidateSaveCommit(CompletePlayerData data, Ownership ownership,
+        Configuration.SyncConfig sync, long leaseDurationMs, boolean finalFlush,
+        long expectedRevision, String expectedDigest) throws SQLException {
+        long startedNanos = System.nanoTime();
+        try (Connection connection = db.getLeaseRenewalConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                SyncRow row = lockSyncRow(connection, ownership.uuid());
+                Timestamp dbNow = currentDatabaseTime(connection);
+                if (finalFlush) {
+                    SaveResult receipt = verifiedFinalReceipt(connection, data, ownership, sync, expectedRevision);
+                    if (receipt != null && row.dataRevision == expectedRevision && !row.recoveryRequired) {
+                        connection.rollback();
+                        return new SaveRevalidation(SaveRevalidationStatus.COMMITTED, receipt, row.dataRevision);
+                    }
+                    if (row.dataRevision == expectedRevision - 1L
+                            && matchesLiveOwnership(row, ownership, dbNow)) {
+                        connection.rollback();
+                        return new SaveRevalidation(SaveRevalidationStatus.NOT_COMMITTED, null, row.dataRevision);
+                    }
+                    connection.rollback();
+                    return new SaveRevalidation(SaveRevalidationStatus.UNCERTAIN, null, row.dataRevision);
+                }
+
+                if (!matchesLiveOwnership(row, ownership, dbNow)) {
+                    connection.rollback();
+                    return new SaveRevalidation(SaveRevalidationStatus.FENCED, null, row.dataRevision);
+                }
+                if (row.dataRevision == expectedRevision - 1L) {
+                    connection.rollback();
+                    return new SaveRevalidation(SaveRevalidationStatus.NOT_COMMITTED, null, row.dataRevision);
+                }
+                if (row.dataRevision != expectedRevision || row.lastCheckpointAt == null
+                        || !expectedDigest.equals(row.checkpointStateDigest)) {
+                    connection.rollback();
+                    return new SaveRevalidation(SaveRevalidationStatus.UNCERTAIN, null, row.dataRevision);
+                }
+                DomainProvenance provenance = DomainProvenance.read(row.domainProvenanceManifest,
+                    row.domainProvenanceRevision, row.domainProvenanceGeneration, row.dataRevision);
+                if (!provenance.authorizesEnabledDomains(sync)) {
+                    connection.rollback();
+                    return new SaveRevalidation(SaveRevalidationStatus.UNCERTAIN, null, row.dataRevision);
+                }
+                CompletePlayerData durable = loadCompletePlayerData(connection, data.uuid).orElse(null);
+                if (durable == null || !expectedDigest.equals(
+                        com.atsukigames.statelink.utils.CheckpointDigest.verifiedStateDigest(durable, sync))) {
+                    connection.rollback();
+                    return new SaveRevalidation(SaveRevalidationStatus.UNCERTAIN, null, row.dataRevision);
+                }
+                long sampleNanos = System.nanoTime();
+                long remainingNanos = conservativeRemainingNanos(row.leaseUntil, dbNow, startedNanos, sampleNanos);
+                long durationNanos = TimeUnit.MILLISECONDS.toNanos(leaseDurationMs);
+                if (remainingNanos <= 0 || remainingNanos > durationNanos) {
+                    connection.rollback();
+                    return new SaveRevalidation(SaveRevalidationStatus.UNCERTAIN, null, row.dataRevision);
+                }
+                long anchor = sampleNanos - (durationNanos - remainingNanos);
+                connection.rollback();
+                return new SaveRevalidation(SaveRevalidationStatus.COMMITTED,
+                    new SaveResult(SaveStatus.COMMITTED, expectedRevision, anchor), row.dataRevision);
+            } catch (Throwable error) {
+                try { connection.rollback(); } catch (SQLException rollbackError) { error.addSuppressed(rollbackError); }
+                if (error instanceof SQLException sqlException) throw sqlException;
+                if (error instanceof RuntimeException runtimeException) throw runtimeException;
+                throw new SQLException("SAVE COMMIT revalidation failed", error);
+            } finally {
+                connection.setAutoCommit(true);
+            }
+        }
+    }
+
+    private static long conservativeRemainingNanos(Timestamp leaseUntil, Timestamp dbNow,
+        long operationStartedNanos, long sampleNanos) {
+        if (leaseUntil == null || dbNow == null || sampleNanos < operationStartedNanos) return 0L;
+        try {
+            long databaseRemaining = Duration.between(dbNow.toInstant(), leaseUntil.toInstant()).toNanos();
+            long verificationRoundTrip = sampleNanos - operationStartedNanos;
+            return Math.max(0L, databaseRemaining - verificationRoundTrip - TimeUnit.MILLISECONDS.toNanos(1));
+        } catch (ArithmeticException overflow) {
+            return 0L;
+        }
     }
 
     private SaveResult saveCompletePlayerDataOnce(
@@ -1216,6 +1648,8 @@ public final class PlayerDataRepository {
             ownership.dataRevision());
         String outcome = "FAILURE";
         Throwable failure = null;
+        long expectedRevision = -1L;
+        String expectedDigest = null;
         try (Connection connection = beginConnection(trace)) {
             try {
                 trace.start("transaction");
@@ -1245,6 +1679,8 @@ public final class PlayerDataRepository {
                 // callerが失敗扱いする。範囲検証はPlayerData更新より前に済ませる。
                 if (row.dataRevision < 0) throw new SQLException("data revision exceeds Java long range");
                 long nextRevision = Math.addExact(row.dataRevision, 1L);
+                expectedRevision = nextRevision;
+                expectedDigest = com.atsukigames.statelink.utils.CheckpointDigest.verifiedStateDigest(data, sync);
                 trace.start("playerDataWrite");
                 upsertPlayerData(connection, data, sync);
                 trace.end("playerDataWrite");
@@ -1294,15 +1730,20 @@ public final class PlayerDataRepository {
                 }
 
                 transactionFaultInjector.at(TransactionPhase.AFTER_OWNERSHIP_UPDATE, finalFlush);
+                writeCheckpointStateDigest(connection, data.uuid, nextRevision, expectedDigest);
                 writeDomainProvenance(connection, data.uuid, DomainProvenance.forConfiguration(sync,
                     nextRevision, Math.addExact(row.domainProvenanceGeneration == null
                         ? 0L : row.domainProvenanceGeneration, 1L)));
                 if (finalFlush) writeFinalReceipt(connection, data, ownership, sync, nextRevision);
                 transactionFaultInjector.at(TransactionPhase.BEFORE_COMMIT, finalFlush);
                 trace.start("commit");
-                connection.commit();
+                try {
+                    connection.commit();
+                    transactionFaultInjector.at(TransactionPhase.AFTER_COMMIT, finalFlush);
+                } catch (SQLException commitError) {
+                    throw new SaveCommitUnknownException(commitError, expectedRevision, expectedDigest);
+                }
                 trace.end("commit");
-                transactionFaultInjector.at(TransactionPhase.AFTER_COMMIT, finalFlush);
                 trace.end("transaction");
                 outcome = "COMMITTED";
                 return new SaveResult(SaveStatus.COMMITTED, nextRevision, leaseAnchorNanos);
@@ -1428,12 +1869,27 @@ public final class PlayerDataRepository {
         }
     }
 
+    private Connection beginLeaseRenewalConnection(DatabaseOperationTrace trace) throws SQLException {
+        trace.start("connectionAcquisition");
+        try {
+            Connection connection = db.getLeaseRenewalConnection();
+            trace.end("connectionAcquisition");
+            return connection;
+        } catch (SQLException error) {
+            trace.end("connectionAcquisition");
+            throw error;
+        }
+    }
+
     private SyncRow lockSyncRow(Connection connection, UUID uuid) throws SQLException {
         String sql = """
             SELECT owner_server, owner_session, fencing_token, lease_until, data_revision,
                 recovery_required, recovery_reason, recovery_required_at, last_checkpoint_at,
                 checkpoint_source_version,automatic_recovery_attempts,automatic_recovery_last_attempt_at,
-                domain_provenance_revision,domain_provenance_generation,domain_provenance_manifest
+                domain_provenance_revision,domain_provenance_generation,domain_provenance_manifest,
+                checkpoint_state_digest,verified_state_server,verified_state_session,verified_state_fence,
+                verified_state_revision,verified_state_provenance_generation,verified_state_provenance_manifest,
+                verified_state_domains,verified_state_digest,verified_state_at
             FROM %s WHERE uuid = ? FOR UPDATE
             """.formatted(db.getCoordinationTableName());
         try (PreparedStatement statement = db.prepareStatement(connection, sql)) {
@@ -1444,6 +1900,12 @@ public final class PlayerDataRepository {
                 Long provenanceRevision = resultSet.wasNull() ? null : provenanceRevisionValue;
                 long provenanceGenerationValue = resultSet.getLong("domain_provenance_generation");
                 Long provenanceGeneration = resultSet.wasNull() ? null : provenanceGenerationValue;
+                long verifiedFenceValue = resultSet.getLong("verified_state_fence");
+                Long verifiedFence = resultSet.wasNull() ? null : verifiedFenceValue;
+                long verifiedRevisionValue = resultSet.getLong("verified_state_revision");
+                Long verifiedRevision = resultSet.wasNull() ? null : verifiedRevisionValue;
+                long verifiedGenerationValue = resultSet.getLong("verified_state_provenance_generation");
+                Long verifiedGeneration = resultSet.wasNull() ? null : verifiedGenerationValue;
                 return new SyncRow(
                     resultSet.getString("owner_server"),
                     resultSet.getString("owner_session"),
@@ -1455,7 +1917,12 @@ public final class PlayerDataRepository {
                     resultSet.getTimestamp("recovery_required_at"),
                     resultSet.getTimestamp("last_checkpoint_at"),resultSet.getString("checkpoint_source_version"),
                     resultSet.getInt("automatic_recovery_attempts"),resultSet.getTimestamp("automatic_recovery_last_attempt_at"),
-                    provenanceRevision, provenanceGeneration, resultSet.getString("domain_provenance_manifest")
+                    provenanceRevision, provenanceGeneration, resultSet.getString("domain_provenance_manifest"),
+                    resultSet.getString("checkpoint_state_digest"), resultSet.getString("verified_state_server"),
+                    resultSet.getString("verified_state_session"), verifiedFence, verifiedRevision,
+                    verifiedGeneration, resultSet.getString("verified_state_provenance_manifest"),
+                    resultSet.getString("verified_state_domains"), resultSet.getString("verified_state_digest"),
+                    resultSet.getTimestamp("verified_state_at")
                 );
             }
         }
@@ -1703,7 +2170,17 @@ public final class PlayerDataRepository {
         Timestamp lastAutomaticAttemptAt,
         Long domainProvenanceRevision,
         Long domainProvenanceGeneration,
-        String domainProvenanceManifest
+        String domainProvenanceManifest,
+        String checkpointStateDigest,
+        String verifiedStateServer,
+        String verifiedStateSession,
+        Long verifiedStateFence,
+        Long verifiedStateRevision,
+        Long verifiedStateProvenanceGeneration,
+        String verifiedStateProvenanceManifest,
+        String verifiedStateDomains,
+        String verifiedStateDigest,
+        Timestamp verifiedStateAt
     ) {}
 
     private static CompletePlayerData mapCompleteData(ResultSet resultSet) throws SQLException {

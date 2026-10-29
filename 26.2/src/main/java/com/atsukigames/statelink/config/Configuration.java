@@ -15,11 +15,13 @@ public class Configuration {
     public RecoveryConfig recovery = new RecoveryConfig();
     public static class RecoveryConfig {
         public boolean enabled = true;
-        public String mode = "safe";
+        // 2.4.0 defaults to availability-first recovery; World/DB rollback risk is accepted.
+        // Explicit existing mode/acknowledgement values are never rewritten.
+        public String mode = "last_checkpoint";
         public int retryIntervalSeconds = 5;
         public int maxWaitSeconds = 120;
-        public int lastCheckpointDelaySeconds = 60;
-        public boolean acknowledgeUnsafeRecovery = false;
+        public int lastCheckpointDelaySeconds = 5;
+        public boolean acknowledgeUnsafeRecovery = true;
         public int autoRecoverDelaySeconds = 5;
         public int maxCheckpointAgeSeconds = 30;
         public int maxAutoRecoveryAttempts = 12;

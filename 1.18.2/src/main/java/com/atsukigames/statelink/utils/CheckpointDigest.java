@@ -41,13 +41,22 @@ public final class CheckpointDigest {
         return domains.toString();
     }
     public static String digest(CompletePlayerData data, Configuration.SyncConfig sync) {
-        return digest(data, sync, false);
+        return digest(data, sync, false, false);
+    }
+    /**
+     * Semantic identity used only to attest an unchanged checkpoint. Vanilla elapsed-time
+     * statistics are deliberately excluded: they are retained in payloads but are not dirty
+     * mutations under the established dirty-only policy.
+     */
+    public static String verifiedStateDigest(CompletePlayerData data, Configuration.SyncConfig sync) {
+        return digest(data, sync, false, true);
     }
     /** Verify old receipts under their original aggregate-position schema only. */
     public static String legacyDigest(CompletePlayerData data, Configuration.SyncConfig sync) {
-        return digest(data, sync, true);
+        return digest(data, sync, true, false);
     }
-    private static String digest(CompletePlayerData data, Configuration.SyncConfig sync, boolean legacy) {
+    private static String digest(CompletePlayerData data, Configuration.SyncConfig sync, boolean legacy,
+        boolean excludePassiveStatistics) {
         JsonObject all = GSON.toJsonTree(data).getAsJsonObject();
         JsonObject selected = new JsonObject();
         selected.add("uuid", all.get("uuid"));
@@ -68,7 +77,16 @@ public final class CheckpointDigest {
         add(selected, all, sync.gamemode, "gamemode", "isFlying", "allowFlying", "isCreativeFlying");
         add(selected, all, sync.playerProfile, "displayName", "skinTexture", "skinSignature");
         add(selected, all, sync.advancements, "advancementsJson");
-        add(selected, all, sync.statistics, "statisticsJson");
+        if (sync.statistics) {
+            if (excludePassiveStatistics) {
+                var statistics = data.statisticsJson == null ? com.google.gson.JsonNull.INSTANCE
+                    : PassiveStatistics.withoutPassiveCounters(data.statisticsJson);
+                if (statistics == null) throw new IllegalArgumentException("Invalid statistics snapshot for attestation");
+                selected.add("statisticsJson", statistics);
+            } else {
+                add(selected, all, true, "statisticsJson");
+            }
+        }
         add(selected, all, sync.recipeBook, "recipeBookJson");
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
